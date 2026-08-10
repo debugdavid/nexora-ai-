@@ -1,4 +1,4 @@
-// Backend with auth + Prisma persistence
+// Backend with auth + Prisma persistence + email verification & password reset
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -8,6 +8,8 @@ const rateLimit = require('express-rate-limit');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const { sendMail } = require('./utils/mailer');
 
 const prisma = new PrismaClient();
 const app = express();
@@ -53,6 +55,13 @@ async function authMiddleware(req, res, next) {
   next();
 }
 
+// Create verification token helper
+async function createVerificationToken(userId, type = 'verify', ttlMinutes = 60 * 24) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + ttlMinutes * 60 * 1000);
+  return await prisma.verificationToken.create({ data: { token, userId, type, expiresAt } });
+}
+
 // Auth routes
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -62,6 +71,13 @@ app.post('/api/auth/register', async (req, res) => {
     if (existing) return res.status(400).json({ error: 'User already exists' });
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await prisma.user.create({ data: { email, passwordHash } });
+
+    // create verification token and send email
+    const v = await createVerificationToken(user.id, 'verify', 60 * 24 * 7); // 7 days
+    const verifyUrl = `${process.env.BACKEND_URL || 'http://localhost:3000'}/api/auth/verify?token=${v.token}`;
+    const html = `<p>Welcome to Nexora AI. Please verify your email by clicking <a href="${verifyUrl}">this link</a>.</p>`;
+    await sendMail(user.email, 'Verify your Nexora AI account', html, `Verify: ${verifyUrl}`);
+
     const token = generateToken(user);
     return res.json({ token, user: { id: user.id, email: user.email } });
   } catch (err) {
@@ -79,14 +95,66 @@ app.post('/api/auth/login', async (req, res) => {
     const ok = await bcrypt.compare(password, user.passwordHash);
     if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
     const token = generateToken(user);
-    return res.json({ token, user: { id: user.id, email: user.email } });
+    return res.json({ token, user: { id: user.id, email: user.email, emailVerified: user.emailVerified } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Login failed' });
   }
 });
 
-// Conversations
+// Verify email
+app.get('/api/auth/verify', async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (!token) return res.status(400).send('token required');
+    const v = await prisma.verificationToken.findUnique({ where: { token } });
+    if (!v || v.expiresAt < new Date()) return res.status(400).send('invalid or expired token');
+    await prisma.user.update({ where: { id: v.userId }, data: { emailVerified: true } });
+    await prisma.verificationToken.deleteMany({ where: { userId: v.userId, type: 'verify' } });
+    // Redirect to frontend with success
+    return res.redirect(`${FRONTEND_URL}/?verified=1`);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).send('Verification failed');
+  }
+});
+
+// Request password reset
+app.post('/api/auth/request-password-reset', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'email required' });
+    const user = await prisma.user.findUnique({ where: { email } });
+    if (!user) return res.json({ ok: true }); // don't reveal existence
+    const v = await createVerificationToken(user.id, 'reset', 60 * 2); // 2 hours
+    const resetUrl = `${FRONTEND_URL}/reset?token=${v.token}`;
+    const html = `<p>To reset your Nexora AI password click <a href="${resetUrl}">this link</a>. If you didn't request this, ignore this email.</p>`;
+    await sendMail(user.email, 'Reset your Nexora AI password', html, `Reset: ${resetUrl}`);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Could not send reset email' });
+  }
+});
+
+// Reset password
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password) return res.status(400).json({ error: 'token and password required' });
+    const v = await prisma.verificationToken.findUnique({ where: { token } });
+    if (!v || v.expiresAt < new Date() || v.type !== 'reset') return res.status(400).json({ error: 'invalid or expired token' });
+    const passwordHash = await bcrypt.hash(password, 10);
+    await prisma.user.update({ where: { id: v.userId }, data: { passwordHash } });
+    await prisma.verificationToken.deleteMany({ where: { userId: v.userId, type: 'reset' } });
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: 'Could not reset password' });
+  }
+});
+
+// Conversations and chat (unchanged from previous)
 app.get('/api/conversations', authMiddleware, async (req, res) => {
   try {
     const convos = await prisma.conversation.findMany({

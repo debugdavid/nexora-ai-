@@ -11,6 +11,7 @@ model User {
   id           String   @id @default(uuid())
   email        String   @unique
   passwordHash String
+  emailVerified Boolean @default(false)
   conversations Conversation[]
   createdAt    DateTime @default(now())
 }
@@ -33,4 +34,14 @@ model Message {
   content        String   @db.Text
   index          Int
   createdAt      DateTime @default(now())
+}
+
+model VerificationToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  type      String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
 }
