@@ -1,14 +1,35 @@
 version: '3.8'
 services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: nexora
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
   backend:
     build: ./backend
     env_file:
-      - .env
+      - ./backend/.env.example
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/nexora?schema=public
+      - JWT_SECRET=change_me_to_a_secure_value
     ports:
       - "3000:3000"
+    depends_on:
+      - db
     restart: unless-stopped
+
   frontend:
     build: ./frontend
     ports:
       - "5173:80"
     restart: unless-stopped
+
+volumes:
+  db-data:
