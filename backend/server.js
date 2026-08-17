@@ -7,6 +7,7 @@ const AWS = require('aws-sdk');
 const Twilio = require('twilio');
 const twilioLib = require('twilio');
 const { Pool } = require('pg');
+const clientProm = require('prom-client');
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -61,10 +62,41 @@ function getPresignedUrl(key, expiresSeconds = parseInt(process.env.PRESIGNED_UR
   return s3.getSignedUrl('getObject', params);
 }
 
+// Metrics: Prometheus client setup
+const METRICS_ENABLED = process.env.METRICS_ENABLED !== 'false';
+if (METRICS_ENABLED) {
+  clientProm.collectDefaultMetrics({ timeout: 5000 });
+}
+
+const replyRequestsTotal = new clientProm.Counter({ name: 'nexis_reply_requests_total', help: 'Total number of reply presigned-url requests' });
+const replyRateLimitedTotal = new clientProm.Counter({ name: 'nexis_reply_rate_limited_total', help: 'Total number of rate-limited reply requests' });
+const presignedGenerationFailures = new clientProm.Counter({ name: 'nexis_presigned_generation_failures_total', help: 'Total number of presigned URL generation failures' });
+const replyRequestDuration = new clientProm.Histogram({ name: 'nexis_reply_request_duration_seconds', help: 'Duration of reply presigned-url requests', buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5] });
+
+// Alerting webhook cooldowns to avoid spamming
+const ALERT_WEBHOOK = process.env.ALERT_WEBHOOK_URL || null;
+const ALERT_COOLDOWN_SEC = parseInt(process.env.ALERT_COOLDOWN_SECONDS || '300', 10); // default 5 minutes
+const lastAlertTimestamps = new Map();
+
+async function maybeSendAlert(type, details) {
+  if (!ALERT_WEBHOOK) return;
+  const now = Date.now();
+  const last = lastAlertTimestamps.get(type) || 0;
+  if (now - last < ALERT_COOLDOWN_SEC * 1000) return; // cooldown
+  lastAlertTimestamps.set(type, now);
+  try {
+    await axios.post(ALERT_WEBHOOK, { type, details, timestamp: new Date().toISOString() }, { timeout: 5000 });
+    console.warn('Sent alert', type);
+  } catch (e) {
+    console.error('Failed to send alert webhook', e?.message || e);
+  }
+}
+
 // Simple in-memory rate limiter for the reply endpoint.
 // Note: for production use, replace with a Redis-backed limiter (express-rate-limit with Redis store).
 const replyRateMap = new Map();
 function replyRateLimiter(req, res, next) {
+  replyRequestsTotal.inc();
   const windowMs = parseInt(process.env.REPLY_RATE_WINDOW_MS || '60000', 10); // default 60s
   const max = parseInt(process.env.REPLY_RATE_MAX || '30', 10); // default 30 requests per window
   const ip = (req.get('x-forwarded-for') || req.ip || req.connection.remoteAddress || '').split(',')[0].trim();
@@ -84,6 +116,8 @@ function replyRateLimiter(req, res, next) {
   res.set('X-RateLimit-Reset', String(Math.ceil((entry.start + windowMs - now) / 1000)));
 
   if (entry.count > max) {
+    replyRateLimitedTotal.inc();
+    maybeSendAlert('reply_rate_limited', { ip, windowMs, max, count: entry.count });
     return res.status(429).json({ error: 'rate_limited' });
   }
   next();
@@ -93,10 +127,11 @@ function replyRateLimiter(req, res, next) {
 function requestLogger(req, res, next) {
   const start = Date.now();
   res.on('finish', () => {
-    const duration = Date.now() - start;
+    const duration = (Date.now() - start) / 1000.0;
     // Log minimal info: timestamp, ip, method, url, status, duration, api-key-present
     const apiKeyProvided = !!(req.get('authorization') || req.get('x-api-key'));
-    console.log(`[reply] ${new Date().toISOString()} ${req.ip} ${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms api_key=${apiKeyProvided}`);
+    console.log(`[reply] ${new Date().toISOString()} ${req.ip} ${req.method} ${req.originalUrl} ${res.statusCode} ${Math.round(duration*1000)}ms api_key=${apiKeyProvided}`);
+    replyRequestDuration.observe(duration);
   });
   next();
 }
@@ -243,6 +278,9 @@ app.post('/webhooks/voicemail', async (req, res) => {
     res.type('text/xml').send('<Response><Say>Thanks, we received your message. We will get back to you shortly.</Say></Response>');
   } catch (err) {
     console.error('webhook error', err?.response?.data || err.message);
+    // Alert on presigned generation failures or repeated errors
+    presignedGenerationFailures.inc();
+    maybeSendAlert('webhook_error', { error: err?.message || err });
     res.status(500).send('error');
   }
 });
@@ -277,7 +315,19 @@ app.get('/voicemails/:id/reply', requireReplyApiKey, replyRateLimiter, requestLo
     }
   } catch (e) {
     console.error('Failed to generate presigned url', e?.message || e);
+    presignedGenerationFailures.inc();
+    maybeSendAlert('presigned_generation_failure', { id, error: e?.message || e });
     return res.status(500).json({ error: 'internal' });
+  }
+});
+
+// Metrics endpoint
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', clientProm.register.contentType);
+    res.end(await clientProm.register.metrics());
+  } catch (e) {
+    res.status(500).end(e?.message || 'error');
   }
 });
 
