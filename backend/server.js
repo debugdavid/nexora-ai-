@@ -1,6 +1,6 @@
 require('dotenv').config();
 const express = require('express');
-const axios = require('axios');
+const axios = require('../lib/retryable-axios');
 const FormData = require('form-data');
 const { v4: uuidv4 } = require('uuid');
 const AWS = require('aws-sdk');
@@ -19,7 +19,6 @@ const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_T
   : null;
 
 function getFullRequestUrl(req) {
-  // Prefer HOST env when behind proxy/ngrok to match Twilio signature generation
   if (process.env.HOST && process.env.HOST.startsWith('http')) {
     return `${process.env.HOST}${req.originalUrl}`;
   }
@@ -50,7 +49,6 @@ async function uploadToS3(buffer, key, contentType='application/octet-stream') {
     Body: buffer,
     ContentType: contentType,
   }).promise();
-  // Return the key; do not expose public URL
   return key;
 }
 
@@ -71,8 +69,7 @@ async function transcribeAudio(buffer, filename='voicemail.wav') {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
       ...form.getHeaders()
     },
-    responseType: 'json',
-    timeout: 120000
+    responseType: 'json'
   });
   return res.data.text;
 }
@@ -85,8 +82,7 @@ async function callLLM(prompt) {
       input: `You are Nexis AI, an assistant for voicemail messages. Reply succinctly and helpfully to this voicemail transcript:\n\n${prompt}`
     };
     const r = await axios.post('https://api.openai.com/v1/responses', body, {
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` },
-      timeout: 60000
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }
     });
     if (r.data.output && Array.isArray(r.data.output) && r.data.output.length) {
       return r.data.output.map(o => (typeof o === 'string' ? o : (o.content && o.content[0] && o.content[0].text) || '')).join('\n');
@@ -111,15 +107,13 @@ async function synthesizeSpeechElevenLabs(text) {
       'xi-api-key': process.env.ELEVENLABS_API_KEY,
       'Content-Type': 'application/json'
     },
-    responseType: 'arraybuffer',
-    timeout: 60000
+    responseType: 'arraybuffer'
   });
   return Buffer.from(r.data);
 }
 
 app.post('/webhooks/voicemail', async (req, res) => {
   try {
-    // Validate Twilio signature to ensure request is genuine
     if (!validateTwilioRequest(req)) {
       console.warn('Invalid Twilio signature for request from', req.ip);
       return res.status(403).send('invalid signature');
@@ -132,21 +126,16 @@ app.post('/webhooks/voicemail', async (req, res) => {
       ? RecordingUrl
       : `${RecordingUrl}.wav`;
 
-    // 1) Download audio
     const audioBuffer = await downloadFile(mediaUrl);
 
-    // 2) Store original in S3 (return key)
     const key = `voicemails/${RecordingSid || uuidv4()}.wav`;
     await uploadToS3(audioBuffer, key, 'audio/wav');
     const s3UrlPublicKey = key;
 
-    // 3) Transcribe using OpenAI Whisper
     const transcript = await transcribeAudio(audioBuffer, key.replace(/^.*\//,''));
 
-    // 4) Call LLM to generate reply text
     const replyText = await callLLM(transcript);
 
-    // 5) Synthesize reply audio (ElevenLabs)
     let replyAudioBuffer;
     try {
       replyAudioBuffer = await synthesizeSpeechElevenLabs(replyText);
@@ -155,7 +144,6 @@ app.post('/webhooks/voicemail', async (req, res) => {
       replyAudioBuffer = null;
     }
 
-    // 6) Upload reply audio and send SMS with presigned link (async reply)
     let replyS3Key = null;
     let presignedUrl = null;
     if (replyAudioBuffer) {
@@ -165,7 +153,6 @@ app.post('/webhooks/voicemail', async (req, res) => {
       presignedUrl = getPresignedUrl(replyS3Key);
     }
 
-    // Send SMS to caller with the transcript and link to reply audio
     if (twilioClient && process.env.TWILIO_PHONE_NUMBER) {
       const body = presignedUrl
         ? `Nexis AI responded to your voicemail. Reply: ${presignedUrl}`
@@ -191,7 +178,6 @@ app.post('/webhooks/voicemail', async (req, res) => {
   }
 });
 
-// Basic env validation
 const required = ['S3_BUCKET','AWS_REGION'];
 const missing = required.filter(k=>!process.env[k]);
 if (missing.length) console.warn('Missing env vars:', missing.join(', '));

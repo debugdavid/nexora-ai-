@@ -5,16 +5,16 @@
    transcribe with OpenAI Whisper, call LLM, synthesize TTS, upload reply,
    send SMS, and update DB state.
 
- This change adds Twilio request validation on the webhook side (server) and
- generates presigned S3 URLs for replies when sending SMS back to callers.
+ This change adds retry/backoff for external HTTP calls via a shared retryable axios
+ instance (lib/retryable-axios.js). It also keeps presigned URL behavior and DB
+ transaction handling.
 */
 
 require('dotenv').config();
 const Queue = require('bull');
-const axios = require('axios');
+const axios = require('../lib/retryable-axios');
 const AWS = require('aws-sdk');
 const Twilio = require('twilio');
-const twilioLib = require('twilio');
 const { Pool } = require('pg');
 const { v4: uuidv4 } = require('uuid');
 
@@ -36,7 +36,6 @@ function getPresignedUrl(key, expiresSeconds = parseInt(process.env.PRESIGNED_UR
 }
 
 async function transcribeAudioFromS3(s3Key) {
-  // Download object from S3
   const obj = await s3.getObject({ Bucket: process.env.S3_BUCKET, Key: s3Key }).promise();
   const buffer = obj.Body;
   if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY not set');
@@ -45,8 +44,7 @@ async function transcribeAudioFromS3(s3Key) {
   form.append('file', buffer, { filename: s3Key });
   form.append('model', 'whisper-1');
   const res = await axios.post('https://api.openai.com/v1/audio/transcriptions', form, {
-    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, ...form.getHeaders() },
-    timeout: 120000
+    headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, ...form.getHeaders() }
   });
   return res.data.text;
 }
@@ -55,7 +53,7 @@ async function callLLM(prompt) {
   const r = await axios.post('https://api.openai.com/v1/responses', {
     model: process.env.OPENAI_LLM_MODEL || 'gpt-4o-mini',
     input: `You are Nexis AI. Reply to the voicemail transcript concisely:\n\n${prompt}`
-  }, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, timeout: 60000 });
+  }, { headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}` } });
 
   if (r.data.output && Array.isArray(r.data.output) && r.data.output.length) {
     return r.data.output.map(o => (typeof o === 'string' ? o : (o.content && o.content[0] && o.content[0].text) || '')).join('\n');
@@ -73,8 +71,7 @@ async function synthesizeSpeechElevenLabs(text) {
   const body = { text };
   const r = await axios.post(url, body, {
     headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY, 'Content-Type': 'application/json' },
-    responseType: 'arraybuffer',
-    timeout: 60000
+    responseType: 'arraybuffer'
   });
   return Buffer.from(r.data);
 }
@@ -90,7 +87,6 @@ processingQueue.process(async (job) => {
   console.log('Processing voicemail', voicemailId);
   const client = await pool.connect();
   try {
-    // Start a DB transaction to lock the row and mark processing
     await client.query('BEGIN');
     const res = await client.query('SELECT * FROM voicemails WHERE id=$1 FOR UPDATE', [voicemailId]);
     if (!res.rows.length) {
@@ -99,23 +95,18 @@ processingQueue.process(async (job) => {
     }
     const row = res.rows[0];
     if (row.status === 'processing' || row.status === 'done') {
-      // Already handled
       await client.query('ROLLBACK');
       console.log('Skipping already-processed voicemail', voicemailId);
       return;
     }
 
-    // mark as processing
     await client.query('UPDATE voicemails SET status=$1, updated_at=now() WHERE id=$2', ['processing', voicemailId]);
     await client.query('COMMIT');
 
-    // Transcribe
     const transcript = await transcribeAudioFromS3(row.s3_key);
 
-    // Call LLM
     const replyText = await callLLM(transcript);
 
-    // TTS
     let replyS3Key = null;
     try {
       const replyBuffer = await synthesizeSpeechElevenLabs(replyText);
@@ -124,10 +115,8 @@ processingQueue.process(async (job) => {
       console.warn('TTS failed', tErr?.message || tErr);
     }
 
-    // Generate presigned URL for reply (if present)
     const presignedUrl = replyS3Key ? getPresignedUrl(replyS3Key) : null;
 
-    // Send SMS back to caller
     if (twilioClient && process.env.TWILIO_PHONE_NUMBER && row.from_number) {
       const body = presignedUrl ? `Nexis AI responded to your voicemail: ${presignedUrl}` : `Nexis AI replied: ${replyText}`;
       try {
@@ -137,7 +126,6 @@ processingQueue.process(async (job) => {
       }
     }
 
-    // Update DB with results
     await client.query('UPDATE voicemails SET status=$1, transcript=$2, reply_text=$3, reply_s3_url=$4, updated_at=now() WHERE id=$5', ['done', transcript, replyText, presignedUrl, voicemailId]);
     console.log('Processed voicemail', voicemailId);
 
