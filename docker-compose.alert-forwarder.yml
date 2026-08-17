@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  forwarder:
+    build: ./forwarder
+    image: nexis/alert-forwarder:latest
+    container_name: nexis-alert-forwarder
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - ./forwarder/.env.forwarder.example
+    environment:
+      # override sensible defaults here, or use a real .env file
+      - ALERT_FORWARDER_SECRET=${ALERT_FORWARDER_SECRET}
+      - FORWARD_SLACK_WEBHOOK_URL=${FORWARD_SLACK_WEBHOOK_URL}
+      - PAGERDUTY_ROUTING_KEY=${PAGERDUTY_ROUTING_KEY}
+      - FORWARDER_DEDUPE_TTL_SECONDS=${FORWARDER_DEDUPE_TTL_SECONDS}
+      - FORWARDER_RETRY_ATTEMPTS=${FORWARDER_RETRY_ATTEMPTS}
+      - FORWARDER_RETRY_BASE_MS=${FORWARDER_RETRY_BASE_MS}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

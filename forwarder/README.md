@@ -1,39 +1,29 @@
-Forwarder README
+## Docker / docker-compose
 
-This small Express-based service receives alert POSTs from the Nexis backend and
-forwards them to one or more configured alerting destinations (Slack, PagerDuty).
-It implements simple auth, deduplication, and retries. It's intended as a small
-forwarder you can deploy inside your infra; for production use please run behind
-TLS, protect the secret, and use a Redis-backed dedupe/rate-limiting store.
+This repo includes a Dockerfile and a docker-compose example for the alert forwarder.
 
-Usage
-1. Configure environment variables (see .env.forwarder.example).
-2. Install deps:
-   cd forwarder
-   npm install
-3. Start:
-   npm start
+Build locally:
 
-Endpoints
-- POST /alerts
-  - Authorization: supply token via x-forwarder-token header or ?token=... query
-  - Body JSON: { type: 'reply_rate_limited', details: { ip: '1.2.3.4', ... }, timestamp: '...' }
-  - Responds: { ok: true, results: [ { to: 'slack', ok: true }, ... ] }
-- GET /health
-  - Simple healthcheck
+  cd forwarder
+  docker build -t nexis/alert-forwarder:local .
 
-Environment variables (.env.forwarder.example)
-- ALERT_FORWARDER_SECRET (required) - secret token expected at x-forwarder-token or ?token=...;
-- FORWARD_SLACK_WEBHOOK_URL (optional) - Slack incoming webhook URL
-- PAGERDUTY_ROUTING_KEY (optional) - PagerDuty Events v2 routing key
-- FORWARDER_DEDUPE_TTL_SECONDS (optional, default 300) - dedupe window in seconds
-- FORWARDER_RETRY_ATTEMPTS (optional, default 3) - retries when forwarding
-- FORWARDER_RETRY_BASE_MS (optional, default 500) - base backoff in ms
+Run with Docker:
 
-Security notes
-- Always run behind HTTPS. Protect ALERT_FORWARDER_SECRET in a secrets manager.
-- Replace the simple token auth with mTLS or HMAC signing for stronger guarantees.
-- For high availability and dedupe across instances, use Redis instead of the in-memory map.
+  docker run -e ALERT_FORWARDER_SECRET=supersecret -e FORWARD_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/... -p 8080:8080 nexis/alert-forwarder:local
 
-Example
-curl -X POST 'https://forwarder.example.com/alerts?token=supersecret' -H 'Content-Type: application/json' -d '{"type":"reply_rate_limited","details":{"ip":"1.2.3.4","count":100}}'
+Run with docker-compose (example file included at docker-compose.alert-forwarder.yml):
+
+  # copy the example env and fill secrets
+  cp forwarder/.env.forwarder.example forwarder/.env
+  # edit forwarder/.env and set ALERT_FORWARDER_SECRET and any forwarding destinations
+
+  docker compose -f docker-compose.alert-forwarder.yml up --build
+
+Healthcheck and logs
+- The compose file exposes a healthcheck on /health.
+- View logs with:
+  docker compose -f docker-compose.alert-forwarder.yml logs -f forwarder
+
+Production notes
+- Use a proper secret manager to inject ALERT_FORWARDER_SECRET (do not commit secrets). Use an orchestration platform (Kubernetes, ECS) for production deployments and use the container image built from CI.
+- Replace the in-memory dedupe map with Redis for HA across instances.
