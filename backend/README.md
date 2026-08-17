@@ -5,6 +5,12 @@ presigned URLs. To obtain a fresh presigned URL for a reply, use the endpoint:
 
 GET /voicemails/:id/reply
 
+Authentication
+- This endpoint is protected by a simple API key. Set the environment variable
+  REPLY_ENDPOINT_API_KEY to a secret value and provide it in requests via either:
+    - Authorization: Bearer <REPLY_ENDPOINT_API_KEY>
+    - X-API-KEY: <REPLY_ENDPOINT_API_KEY>
+
 Response:
 {
   "url": "https://...s3.amazonaws.com/replies/...",

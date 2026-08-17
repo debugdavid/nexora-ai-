@@ -207,8 +207,20 @@ app.post('/webhooks/voicemail', async (req, res) => {
   }
 });
 
+// simple API key middleware for the presigned reply endpoint
+function requireReplyApiKey(req, res, next) {
+  const expected = process.env.REPLY_ENDPOINT_API_KEY;
+  if (!expected) return res.status(501).json({ error: 'reply auth not configured' });
+  const authHeader = req.get('authorization');
+  const provided = authHeader && authHeader.toLowerCase().startsWith('bearer ')
+    ? authHeader.slice(7).trim()
+    : req.get('x-api-key');
+  if (!provided || provided !== expected) return res.status(401).json({ error: 'unauthorized' });
+  next();
+}
+
 // Endpoint to generate a presigned URL for a voicemail reply on demand
-app.get('/voicemails/:id/reply', async (req, res) => {
+app.get('/voicemails/:id/reply', requireReplyApiKey, async (req, res) => {
   if (!pool) return res.status(501).json({ error: 'Database not configured' });
   const id = parseInt(req.params.id, 10);
   if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid id' });
