@@ -11,6 +11,11 @@ Authentication
     - Authorization: Bearer <REPLY_ENDPOINT_API_KEY>
     - X-API-KEY: <REPLY_ENDPOINT_API_KEY>
 
+Rate limiting
+- The reply endpoint has a simple per-IP rate limiter. Configure via env vars:
+  - REPLY_RATE_WINDOW_MS (default 60000 = 60s)
+  - REPLY_RATE_MAX (default 30 requests per window)
+
 Response:
 {
   "url": "https://...s3.amazonaws.com/replies/...",

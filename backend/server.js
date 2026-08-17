@@ -61,6 +61,46 @@ function getPresignedUrl(key, expiresSeconds = parseInt(process.env.PRESIGNED_UR
   return s3.getSignedUrl('getObject', params);
 }
 
+// Simple in-memory rate limiter for the reply endpoint.
+// Note: for production use, replace with a Redis-backed limiter (express-rate-limit with Redis store).
+const replyRateMap = new Map();
+function replyRateLimiter(req, res, next) {
+  const windowMs = parseInt(process.env.REPLY_RATE_WINDOW_MS || '60000', 10); // default 60s
+  const max = parseInt(process.env.REPLY_RATE_MAX || '30', 10); // default 30 requests per window
+  const ip = (req.get('x-forwarded-for') || req.ip || req.connection.remoteAddress || '').split(',')[0].trim();
+  const now = Date.now();
+  const entry = replyRateMap.get(ip) || { count: 0, start: now };
+  if (now - entry.start > windowMs) {
+    entry.count = 1;
+    entry.start = now;
+  } else {
+    entry.count += 1;
+  }
+  replyRateMap.set(ip, entry);
+
+  // set informative headers
+  res.set('X-RateLimit-Limit', String(max));
+  res.set('X-RateLimit-Remaining', String(Math.max(0, max - entry.count)));
+  res.set('X-RateLimit-Reset', String(Math.ceil((entry.start + windowMs - now) / 1000)));
+
+  if (entry.count > max) {
+    return res.status(429).json({ error: 'rate_limited' });
+  }
+  next();
+}
+
+// Basic request logger for the reply endpoint
+function requestLogger(req, res, next) {
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    // Log minimal info: timestamp, ip, method, url, status, duration, api-key-present
+    const apiKeyProvided = !!(req.get('authorization') || req.get('x-api-key'));
+    console.log(`[reply] ${new Date().toISOString()} ${req.ip} ${req.method} ${req.originalUrl} ${res.statusCode} ${duration}ms api_key=${apiKeyProvided}`);
+  });
+  next();
+}
+
 async function transcribeAudio(buffer, filename='voicemail.wav') {
   if (!process.env.OPENAI_API_KEY) throw new Error('OPENAI_API_KEY not set');
   const form = new FormData();
@@ -220,7 +260,7 @@ function requireReplyApiKey(req, res, next) {
 }
 
 // Endpoint to generate a presigned URL for a voicemail reply on demand
-app.get('/voicemails/:id/reply', requireReplyApiKey, async (req, res) => {
+app.get('/voicemails/:id/reply', requireReplyApiKey, replyRateLimiter, requestLogger, async (req, res) => {
   if (!pool) return res.status(501).json({ error: 'Database not configured' });
   const id = parseInt(req.params.id, 10);
   if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid id' });
@@ -244,6 +284,15 @@ app.get('/voicemails/:id/reply', requireReplyApiKey, async (req, res) => {
 const required = ['S3_BUCKET','AWS_REGION'];
 const missing = required.filter(k=>!process.env[k]);
 if (missing.length) console.warn('Missing env vars:', missing.join(', '));
+
+// periodic cleanup of rate map to avoid memory growth (runs every 5 minutes)
+setInterval(() => {
+  const now = Date.now();
+  const maxWindow = parseInt(process.env.REPLY_RATE_WINDOW_MS || '60000', 10) * 2;
+  for (const [key, entry] of replyRateMap.entries()) {
+    if (now - entry.start > maxWindow) replyRateMap.delete(key);
+  }
+}, 5 * 60 * 1000);
 
 const port = process.env.PORT || 3000;
 app.listen(port, ()=>console.log(`Nexis AI webhook listening on ${port}`));
