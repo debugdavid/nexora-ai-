@@ -6,6 +6,7 @@ const { v4: uuidv4 } = require('uuid');
 const AWS = require('aws-sdk');
 const Twilio = require('twilio');
 const twilioLib = require('twilio');
+const { Pool } = require('pg');
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -13,6 +14,8 @@ app.use(express.json());
 
 AWS.config.update({ region: process.env.AWS_REGION });
 const s3 = new AWS.S3();
+
+const pool = process.env.DATABASE_URL ? new Pool({ connectionString: process.env.DATABASE_URL }) : null;
 
 const twilioClient = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
   ? Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
@@ -132,6 +135,20 @@ app.post('/webhooks/voicemail', async (req, res) => {
     await uploadToS3(audioBuffer, key, 'audio/wav');
     const s3UrlPublicKey = key;
 
+    // Persist voicemail row if DB available
+    let voicemailId = null;
+    if (pool) {
+      const client = await pool.connect();
+      try {
+        const insertRes = await client.query(`INSERT INTO voicemails (recording_sid, s3_key, s3_url, from_number, status) VALUES ($1,$2,$3,$4,$5) RETURNING id`, [RecordingSid || null, key, null, From || null, 'uploaded']);
+        voicemailId = insertRes.rows[0].id;
+      } catch (e) {
+        console.warn('Failed to persist voicemail row', e?.message || e);
+      } finally {
+        client.release();
+      }
+    }
+
     const transcript = await transcribeAudio(audioBuffer, key.replace(/^.*\//,''));
 
     const replyText = await callLLM(transcript);
@@ -151,6 +168,18 @@ app.post('/webhooks/voicemail', async (req, res) => {
       await uploadToS3(replyAudioBuffer, replyKey, 'audio/mpeg');
       replyS3Key = replyKey;
       presignedUrl = getPresignedUrl(replyS3Key);
+
+      // If DB available, save reply_s3_key (not the presigned URL)
+      if (pool && voicemailId) {
+        const client = await pool.connect();
+        try {
+          await client.query('UPDATE voicemails SET reply_s3_key=$1, updated_at=now() WHERE id=$2', [replyS3Key, voicemailId]);
+        } catch (e) {
+          console.warn('Failed to update voicemail with reply key', e?.message || e);
+        } finally {
+          client.release();
+        }
+      }
     }
 
     if (twilioClient && process.env.TWILIO_PHONE_NUMBER) {
@@ -170,11 +199,33 @@ app.post('/webhooks/voicemail', async (req, res) => {
       console.warn('Twilio not configured; skipping SMS');
     }
 
-    console.log({ s3Key: s3UrlPublicKey, transcript, replyText, replyS3Key, From });
+    console.log({ s3Key: s3UrlPublicKey, transcript, replyText, replyS3Key, From, voicemailId });
     res.type('text/xml').send('<Response><Say>Thanks, we received your message. We will get back to you shortly.</Say></Response>');
   } catch (err) {
     console.error('webhook error', err?.response?.data || err.message);
     res.status(500).send('error');
+  }
+});
+
+// Endpoint to generate a presigned URL for a voicemail reply on demand
+app.get('/voicemails/:id/reply', async (req, res) => {
+  if (!pool) return res.status(501).json({ error: 'Database not configured' });
+  const id = parseInt(req.params.id, 10);
+  if (Number.isNaN(id)) return res.status(400).json({ error: 'invalid id' });
+  try {
+    const client = await pool.connect();
+    try {
+      const q = await client.query('SELECT reply_s3_key FROM voicemails WHERE id=$1', [id]);
+      if (!q.rows.length || !q.rows[0].reply_s3_key) return res.status(404).json({ error: 'no reply audio' });
+      const key = q.rows[0].reply_s3_key;
+      const url = getPresignedUrl(key);
+      return res.json({ url, expires_in: parseInt(process.env.PRESIGNED_URL_EXPIRY_SECONDS || '3600', 10) });
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('Failed to generate presigned url', e?.message || e);
+    return res.status(500).json({ error: 'internal' });
   }
 });
 

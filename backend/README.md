@@ -1,15 +1,14 @@
-# Worker & DB queue added
+# Backend README updates
 
-I added a background worker implementation and DB schema. To run:
+This project now stores reply S3 object keys in the database rather than storing
+presigned URLs. To obtain a fresh presigned URL for a reply, use the endpoint:
 
-1) Ensure Redis and Postgres are running and environment variables are set in .env:
-   - REDIS_URL
-   - DATABASE_URL
-2) Apply DB schema:
-   psql $DATABASE_URL -f db/schema.sql
-3) Install dependencies:
-   npm install
-4) Start worker in a separate terminal:
-   npm run worker
+GET /voicemails/:id/reply
 
-The worker listens for jobs added by the webhook and processes them (transcription, LLM, TTS, SMS).
+Response:
+{
+  "url": "https://...s3.amazonaws.com/replies/...",
+  "expires_in": 3600
+}
+
+This ensures presigned links are generated on demand and do not expire in the DB.
